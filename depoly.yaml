@@ -1,0 +1,267 @@
+name: Deploy Next.js Application
+
+on:
+  push:
+    branches:
+      - main
+      - production
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Deploy to Digital Ocean
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.DO_HOST }}
+          username: ${{ secrets.DO_USERNAME }}
+          key: ${{ secrets.DO_SSH_KEY }}
+          passphrase: ${{ secrets.DO_SSH_PASSPHRASE }}
+          script: |
+            # Enable error handling
+            set -e
+
+            # Function for error handling
+            handle_error() {
+              echo "ERROR: Deployment failed at step: $1"
+              exit 1
+            }
+
+            # Set variables from GitHub secrets
+            export PROJECT_NAME="${{ secrets.PROJECT_NAME }}"
+            export PROJECT_REPO="${{ secrets.PROJECT_REPO }}"
+            export PROJECT_DOMAIN="${{ secrets.PROJECT_DOMAIN }}"
+            export PORT="${{ secrets.PROJECT_PORT }}"
+            export PROJECT_PATH="/var/www/${PROJECT_NAME}"
+            export PM2_FILE_TYPE="${{ secrets.PM2_FILE_TYPE || 'cjs' }}"  # Default to cjs if not specified
+
+            # Check for port conflicts
+            if netstat -tuln | grep ":${PORT}" > /dev/null; then
+              echo "WARNING: Port ${PORT} is already in use. Check for conflicts."
+              # Continue but warn - you may want to fail here instead
+            fi
+
+            # Step 1: Clone or pull the latest version with error handling
+            echo "Checking repository..."
+            if [ -d "$PROJECT_PATH" ]; then
+              echo "Repository exists, pulling latest changes..."
+              cd $PROJECT_PATH || handle_error "Failed to change to project directory"
+              git pull origin main || handle_error "Failed to pull latest code"
+            else
+              echo "Cloning repository..."
+              mkdir -p $PROJECT_PATH || handle_error "Failed to create project directory"
+              
+              # Handle private repository authentication if needed
+              if [[ "$PROJECT_REPO" == *"git@"* ]]; then
+                # Ensure SSH agent is running for private repos
+                eval $(ssh-agent) > /dev/null
+                ssh-add ~/.ssh/id_rsa 2>/dev/null || echo "SSH key not added, ensure keys are configured"
+              fi
+              
+              git clone $PROJECT_REPO $PROJECT_PATH || handle_error "Failed to clone repository"
+              cd $PROJECT_PATH || handle_error "Failed to change to project directory" 
+            fi
+
+            # Step 2: Install dependencies and build the project with error handling
+            echo "Installing dependencies..."
+            cd $PROJECT_PATH || handle_error "Failed to change directory"
+            npm install || handle_error "Failed to install dependencies"
+
+            echo "Building project..."
+            npm run build || handle_error "Failed to build project"
+
+            # Step 3: Create environment file from GitHub secrets
+            echo "Checking for environment file changes..."
+            cat << 'EOF' > /tmp/env-new
+            ${{ secrets.ENV_FILE }}
+            EOF
+
+            if [ ! -f ".env" ] || ! cmp -s "/tmp/env-new" ".env"; then
+              echo "Creating/updating .env file..."
+              cp /tmp/env-new .env || handle_error "Failed to create .env file"
+            else
+              echo ".env file unchanged"
+            fi
+            rm /tmp/env-new
+
+            # Step 4: Configure PM2 ecosystem file
+            echo "Checking for PM2 config changes..."
+            PM2_FILE="ecosystem.config.${PM2_FILE_TYPE}"
+
+            cat << EOF > /tmp/ecosystem-new.config
+            module.exports = {
+              apps: [
+                {
+                  name: "${PROJECT_NAME}",
+                  script: "npm",
+                  args: "start",
+                  cwd: "${PROJECT_PATH}",
+                  env: {
+                    NODE_ENV: "production",
+                    PORT: ${PORT},
+                    ${{ secrets.PM2_ENV_VARS }}
+                  },
+                  // Error log file path
+                  error_file: "${PROJECT_PATH}/logs/error.log",
+                  // Out log file path
+                  out_file: "${PROJECT_PATH}/logs/out.log",
+                  // Enable/disable watch mode
+                  watch: false,
+                  // Max memory restart (if app exceeds this, PM2 will restart it)
+                  max_memory_restart: "500M"
+                }
+              ]
+            };
+            EOF
+
+            # Create logs directory if it doesn't exist
+            mkdir -p "${PROJECT_PATH}/logs" || handle_error "Failed to create logs directory"
+
+            # Only update if content differs or file doesn't exist
+            if [ ! -f "$PM2_FILE" ] || ! cmp -s "/tmp/ecosystem-new.config" "$PM2_FILE"; then
+              echo "Creating/updating PM2 ecosystem config..."
+              cp /tmp/ecosystem-new.config "$PM2_FILE" || handle_error "Failed to create PM2 config"
+            else
+              echo "PM2 config unchanged"
+            fi
+            rm /tmp/ecosystem-new.config
+
+            # Step 5: Create and configure Nginx - check for project-specific static dirs
+            echo "Checking Nginx configuration..."
+
+            # Check if custom directories exist
+            HAS_UPLOADS=false
+            if [ -d "${PROJECT_PATH}/public/uploads" ]; then
+              HAS_UPLOADS=true
+            fi
+
+            # Create Nginx config
+            cat << EOF > /tmp/nginx-${PROJECT_NAME}
+            server {
+              server_name ${PROJECT_DOMAIN};
+
+              location / {
+                proxy_pass http://localhost:${PORT};
+                proxy_http_version 1.1;
+                proxy_set_header Upgrade \$http_upgrade;
+                proxy_set_header Connection 'upgrade';
+                proxy_set_header Host \$host;
+                proxy_cache_bypass \$http_upgrade;
+              }
+            EOF
+
+            # Only add uploads location if directory exists
+            if [ "$HAS_UPLOADS" = true ]; then
+              cat << EOF >> /tmp/nginx-${PROJECT_NAME}
+              
+              location /uploads/ {
+                alias ${PROJECT_PATH}/public/uploads/;
+                access_log off;
+                expires 1y;
+                add_header Cache-Control "public";
+              }
+            EOF
+            fi
+
+            # Next.js static files
+            if [ -d "${PROJECT_PATH}/.next/static" ]; then
+              cat << EOF >> /tmp/nginx-${PROJECT_NAME}
+              
+              location /_next/static/ {
+                alias ${PROJECT_PATH}/.next/static/;
+                access_log off;
+                expires 30d;
+                add_header Cache-Control "public";
+              }
+            EOF
+            fi
+
+            # Public static files
+            if [ -d "${PROJECT_PATH}/public/static" ]; then
+              cat << EOF >> /tmp/nginx-${PROJECT_NAME}
+              
+              location /static/ {
+                alias ${PROJECT_PATH}/public/static/;
+                access_log off;
+                expires 30d;
+                add_header Cache-Control "public";
+              }
+            EOF
+            fi
+
+            # Complete the server block
+            cat << EOF >> /tmp/nginx-${PROJECT_NAME}
+            }
+
+            server {
+              listen 80;
+              server_name ${PROJECT_DOMAIN};
+              return 301 https://\$host\$request_uri;
+            }
+            EOF
+
+            # Check if Nginx config already exists and compare
+            NGINX_CONFIG_PATH="/etc/nginx/sites-available/${PROJECT_NAME}"
+
+            if [ -f "$NGINX_CONFIG_PATH" ]; then
+              # Compare with existing config
+              if ! cmp -s "/tmp/nginx-${PROJECT_NAME}" "$NGINX_CONFIG_PATH"; then
+                echo "Nginx configuration changed, updating..."
+                sudo cp /tmp/nginx-${PROJECT_NAME} "$NGINX_CONFIG_PATH" || handle_error "Failed to update Nginx config"
+              else
+                echo "Nginx configuration unchanged"
+              fi
+            else
+              # Create new config
+              echo "Creating new Nginx configuration..."
+              sudo cp /tmp/nginx-${PROJECT_NAME} "$NGINX_CONFIG_PATH" || handle_error "Failed to create Nginx config"
+            fi
+
+            rm /tmp/nginx-${PROJECT_NAME}
+
+            # Create symbolic link if not exists
+            if [ ! -f "/etc/nginx/sites-enabled/${PROJECT_NAME}" ]; then
+              echo "Creating Nginx symbolic link..."
+              sudo ln -s "$NGINX_CONFIG_PATH" "/etc/nginx/sites-enabled/${PROJECT_NAME}" || handle_error "Failed to create symbolic link"
+            fi
+
+            # Test Nginx configuration
+            echo "Testing Nginx configuration..."
+            sudo nginx -t || handle_error "Nginx configuration test failed"
+
+            # Step 6: Restart/start PM2 process and reload Nginx
+            echo "Starting/restarting services..."
+            cd $PROJECT_PATH || handle_error "Failed to change directory"
+
+            # Start or reload PM2 process
+            if pm2 list | grep -q "$PROJECT_NAME"; then
+              echo "Reloading PM2 process..."
+              pm2 reload "$PM2_FILE" || handle_error "Failed to reload PM2 process"
+            else
+              echo "Starting PM2 process..."
+              pm2 start "$PM2_FILE" || handle_error "Failed to start PM2 process"
+            fi
+
+            # Save PM2 process list
+            pm2 save || echo "Warning: Could not save PM2 process list"
+
+            # Restart Nginx only if necessary
+            echo "Reloading Nginx..."
+            sudo systemctl reload nginx || handle_error "Failed to reload Nginx"
+
+            # Step 7: Set up or check SSL
+            # Check if certificate exists and is not about to expire (less than 30 days)
+            if [ ! -d "/etc/letsencrypt/live/${PROJECT_DOMAIN}" ] || 
+               [ "$(sudo certbot certificates -d "${PROJECT_DOMAIN}" 2>/dev/null | grep 'VALID:' | grep -oP '\d+(?= days)' | head -1)" -lt "30" ]; then
+              echo "Setting up or renewing SSL certificate..."
+              sudo certbot --nginx -d "${PROJECT_DOMAIN}" --non-interactive --agree-tos \
+                   --email ${{ secrets.SSL_EMAIL }} \
+                   --keep-until-expiring --redirect || echo "Warning: SSL setup/renewal had issues"
+            else
+              echo "SSL certificate is valid and not near expiration"
+            fi
+
+            echo "Deployment completed successfully!"
