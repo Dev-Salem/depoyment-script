@@ -35,16 +35,25 @@ jobs:
               local missing_secrets=()
               
               # Check each required secret
-              [ -z "${{ secrets.DO_HOST }}" ] && missing_secrets+=("DO_HOST")
-              [ -z "${{ secrets.DO_USERNAME }}" ] && missing_secrets+=("DO_USERNAME")
-              [ -z "${{ secrets.DO_SSH_KEY }}" ] && missing_secrets+=("DO_SSH_KEY")
-              [ -z "${{ secrets.PROJECT_NAME }}" ] && missing_secrets+=("PROJECT_NAME")
-              [ -z "${{ secrets.PROJECT_REPO }}" ] && missing_secrets+=("PROJECT_REPO")
-              [ -z "${{ secrets.PROJECT_DOMAIN }}" ] && missing_secrets+=("PROJECT_DOMAIN")
-              [ -z "${{ secrets.PROJECT_PORT }}" ] && missing_secrets+=("PROJECT_PORT")
-              [ -z "${{ secrets.ENV_FILE }}" ] && missing_secrets+=("ENV_FILE")
-              [ -z "${{ secrets.PM2_ENV_VARS }}" ] && missing_secrets+=("PM2_ENV_VARS")
-              [ -z "${{ secrets.SSL_EMAIL }}" ] && missing_secrets+=("SSL_EMAIL")
+              # Server access credentials 
+              [ -z "${{ secrets.DO_HOST }}" ] && missing_secrets+=("DO_HOST")  # Digital Ocean server IP address or hostname
+              [ -z "${{ secrets.DO_USERNAME }}" ] && missing_secrets+=("DO_USERNAME")  # SSH username for the server
+              [ -z "${{ secrets.DO_SSH_KEY }}" ] && missing_secrets+=("DO_SSH_KEY")  # SSH private key for authentication
+              # DO_SSH_PASSPHRASE is used in the SSH action config if the key has a passphrase (optional)
+              
+              # Project configuration
+              [ -z "${{ secrets.PROJECT_NAME }}" ] && missing_secrets+=("PROJECT_NAME")  # Name of the project (used for directory and PM2 process)
+              [ -z "${{ secrets.PROJECT_REPO }}" ] && missing_secrets+=("PROJECT_REPO")  # Git repository URL for the project
+              [ -z "${{ secrets.PROJECT_DOMAIN }}" ] && missing_secrets+=("PROJECT_DOMAIN")  # Domain name for Nginx and SSL
+              
+              # Application configuration
+              [ -z "${{ secrets.ENV_FILE }}" ] && missing_secrets+=("ENV_FILE")  # Content of the .env file for the app
+              [ -z "${{ secrets.PM2_ENV_VARS }}" ] && missing_secrets+=("PM2_ENV_VARS")  # Additional environment variables for PM2
+              
+              # SSL configuration
+              [ -z "${{ secrets.SSL_EMAIL }}" ] && missing_secrets+=("SSL_EMAIL")  # Email for Let's Encrypt SSL certificate
+              
+              # Optional: PM2_FILE_TYPE controls ecosystem file extension (defaults to 'cjs' if not set)
               
               # If any secrets are missing, print error and exit
               if [ ${#missing_secrets[@]} -gt 0 ]; then
@@ -59,11 +68,68 @@ jobs:
             # Validate secrets before proceeding
             validate_required_secrets
 
+            # Function to find an available port or use the assigned one
+            find_available_port() {
+              local project_name=$1
+              local preferred_port=$2
+              local port_config_file="/var/www/port_mappings.json"
+              local min_port=3000
+              local max_port=4000
+              
+              # Create port mapping file if it doesn't exist
+              if [ ! -f "$port_config_file" ]; then
+                echo "{}" > "$port_config_file"
+              fi
+              
+              # Check if this project already has an assigned port
+              local assigned_port=$(jq -r ".[\"$project_name\"] // \"\"" "$port_config_file")
+              
+              if [ -n "$assigned_port" ] && [ "$assigned_port" != "null" ]; then
+                echo "Project has previously assigned port: $assigned_port"
+                # Verify the port is still available (not used by another process)
+                if ! netstat -tuln | grep -q ":$assigned_port "; then
+                  echo "Using previously assigned port: $assigned_port"
+                  return $assigned_port
+                else
+                  echo "Previously assigned port $assigned_port is now in use by another process"
+                  # Continue to find a new port
+                fi
+              fi
+              
+              # Use preferred port if specified and available
+              if [ -n "$preferred_port" ] && ! netstat -tuln | grep -q ":$preferred_port "; then
+                # Update port mapping file
+                jq ".[\"$project_name\"] = \"$preferred_port\"" "$port_config_file" > "$port_config_file.tmp" && 
+                mv "$port_config_file.tmp" "$port_config_file"
+                echo "Using preferred port: $preferred_port"
+                return $preferred_port
+              fi
+              
+              # Find an available port in the range
+              for port in $(seq $min_port $max_port); do
+                if ! netstat -tuln | grep -q ":$port "; then
+                  # Update port mapping file
+                  jq ".[\"$project_name\"] = \"$port\"" "$port_config_file" > "$port_config_file.tmp" && 
+                  mv "$port_config_file.tmp" "$port_config_file"
+                  echo "Assigned new port: $port"
+                  return $port
+                fi
+              done
+              
+              echo "ERROR: No available ports found in range $min_port-$max_port"
+              exit 1
+            }
+
             # Set variables from GitHub secrets
             export PROJECT_NAME="${{ secrets.PROJECT_NAME }}"
             export PROJECT_REPO="${{ secrets.PROJECT_REPO }}"
             export PROJECT_DOMAIN="${{ secrets.PROJECT_DOMAIN }}"
-            export PORT="${{ secrets.PROJECT_PORT }}"
+
+            # Get port dynamically or use preferred port from secrets if available
+            PORT=$(find_available_port "$PROJECT_NAME" "${{ secrets.PROJECT_PORT || '' }}")
+            export PORT
+
+            echo "Using port $PORT for $PROJECT_NAME"
             export PROJECT_PATH="/var/www/${PROJECT_NAME}"
             export PM2_FILE_TYPE="${{ secrets.PM2_FILE_TYPE || 'cjs' }}"  # Default to cjs if not specified
 
