@@ -30,6 +30,35 @@ jobs:
               exit 1
             }
 
+            # Function to validate required secrets
+            validate_required_secrets() {
+              local missing_secrets=()
+              
+              # Check each required secret
+              [ -z "${{ secrets.DO_HOST }}" ] && missing_secrets+=("DO_HOST")
+              [ -z "${{ secrets.DO_USERNAME }}" ] && missing_secrets+=("DO_USERNAME")
+              [ -z "${{ secrets.DO_SSH_KEY }}" ] && missing_secrets+=("DO_SSH_KEY")
+              [ -z "${{ secrets.PROJECT_NAME }}" ] && missing_secrets+=("PROJECT_NAME")
+              [ -z "${{ secrets.PROJECT_REPO }}" ] && missing_secrets+=("PROJECT_REPO")
+              [ -z "${{ secrets.PROJECT_DOMAIN }}" ] && missing_secrets+=("PROJECT_DOMAIN")
+              [ -z "${{ secrets.PROJECT_PORT }}" ] && missing_secrets+=("PROJECT_PORT")
+              [ -z "${{ secrets.ENV_FILE }}" ] && missing_secrets+=("ENV_FILE")
+              [ -z "${{ secrets.PM2_ENV_VARS }}" ] && missing_secrets+=("PM2_ENV_VARS")
+              [ -z "${{ secrets.SSL_EMAIL }}" ] && missing_secrets+=("SSL_EMAIL")
+              
+              # If any secrets are missing, print error and exit
+              if [ ${#missing_secrets[@]} -gt 0 ]; then
+                echo "ERROR: The following required secrets are missing:"
+                printf "  - %s\n" "${missing_secrets[@]}"
+                exit 1
+              fi
+              
+              echo "✓ All required secrets are available"
+            }
+
+            # Validate secrets before proceeding
+            validate_required_secrets
+
             # Set variables from GitHub secrets
             export PROJECT_NAME="${{ secrets.PROJECT_NAME }}"
             export PROJECT_REPO="${{ secrets.PROJECT_REPO }}"
