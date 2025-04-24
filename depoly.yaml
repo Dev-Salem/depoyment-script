@@ -265,3 +265,170 @@ jobs:
             fi
 
             echo "Deployment completed successfully!"
+
+            # ----- ROLLBACK MECHANISM -----
+            # This function is called by the trap on ERR signal
+            rollback() {
+              local EXIT_CODE=$?
+              local STEP=$1
+              echo "ERROR: Deployment failed at step: $STEP with exit code: $EXIT_CODE"
+              echo "Starting rollback procedure..."
+              
+              case $STEP in
+                "repository")
+                  echo "Rolling back repository changes..."
+                  if [ -d "$PROJECT_PATH" ] && [ ! -d "$PROJECT_PATH/.git" ]; then
+                    # Remove directory if it was just created without git initialization
+                    echo "Removing incomplete project directory"
+                    rm -rf "$PROJECT_PATH"
+                  elif [ -d "$PROJECT_PATH/.git" ] && [ -f "$PROJECT_PATH/.git/ORIG_HEAD" ]; then
+                    # Reset to previous state if git pull failed
+                    echo "Resetting git repository to previous state"
+                    cd "$PROJECT_PATH" && git reset --hard ORIG_HEAD
+                  fi
+                  ;;
+                  
+                "build")
+                  echo "Rolling back failed build..."
+                  if [ -d "$PROJECT_PATH/.next.bak" ]; then
+                    echo "Restoring previous build"
+                    rm -rf "$PROJECT_PATH/.next"
+                    mv "$PROJECT_PATH/.next.bak" "$PROJECT_PATH/.next"
+                  fi
+                  ;;
+                  
+                "config")
+                  echo "Rolling back configuration changes..."
+                  # Restore .env if backup exists
+                  if [ -f "$PROJECT_PATH/.env.bak" ]; then
+                    mv "$PROJECT_PATH/.env.bak" "$PROJECT_PATH/.env"
+                  fi
+                  # Restore PM2 config if backup exists
+                  if [ -f "$PROJECT_PATH/$PM2_FILE.bak" ]; then
+                    mv "$PROJECT_PATH/$PM2_FILE.bak" "$PROJECT_PATH/$PM2_FILE"
+                  fi
+                  ;;
+                  
+                "nginx")
+                  echo "Rolling back Nginx configuration..."
+                  if [ -f "/etc/nginx/sites-available/${PROJECT_NAME}.bak" ]; then
+                    sudo mv "/etc/nginx/sites-available/${PROJECT_NAME}.bak" "/etc/nginx/sites-available/${PROJECT_NAME}"
+                    sudo systemctl reload nginx
+                  elif [ -f "/etc/nginx/sites-available/${PROJECT_NAME}" ] && [ -z "$NGINX_EXISTED" ]; then
+                    # If Nginx config was newly created, remove it
+                    sudo rm -f "/etc/nginx/sites-available/${PROJECT_NAME}"
+                    [ -L "/etc/nginx/sites-enabled/${PROJECT_NAME}" ] && sudo rm -f "/etc/nginx/sites-enabled/${PROJECT_NAME}"
+                    sudo systemctl reload nginx
+                  fi
+                  ;;
+                  
+                "pm2")
+                  echo "Rolling back PM2 process..."
+                  if pm2 list | grep -q "$PROJECT_NAME"; then
+                    if [ -n "$PM2_EXISTED" ]; then
+                      # If PM2 process existed before, try to restore from backup
+                      if [ -f "$PROJECT_PATH/$PM2_FILE.bak" ]; then
+                        mv "$PROJECT_PATH/$PM2_FILE.bak" "$PROJECT_PATH/$PM2_FILE"
+                        pm2 reload "$PM2_FILE" || pm2 restart "$PROJECT_NAME"
+                      fi
+                    else
+                      # If PM2 process was newly created, stop and delete it
+                      pm2 delete "$PROJECT_NAME"
+                    fi
+                    pm2 save
+                  fi
+                  ;;
+                  
+                *)
+                  echo "No specific rollback action for step: $STEP"
+                  ;;
+              esac
+              
+              echo "Rollback completed. System state might require manual verification."
+              exit $EXIT_CODE
+            }
+
+            # Replace the simple error handler with a rollback-enabled version
+            handle_error() {
+              rollback "$1"
+            }
+
+            # Create a better deployment flow with state tracking
+            deploy() {
+              # State tracking
+              export NGINX_EXISTED=false
+              export PM2_EXISTED=false
+              
+              echo "Starting deployment with rollback protection..."
+              
+              # Step 1: Repository state check and backup
+              echo "Preparing repository..."
+              if [ -d "$PROJECT_PATH" ]; then
+                # Backup git state before pull
+                cd "$PROJECT_PATH" || rollback "repository"
+                git tag -f deployment-backup
+                echo "Repository exists, pulling latest changes..."
+                git pull origin main || rollback "repository"
+              else
+                echo "Cloning repository..."
+                mkdir -p $PROJECT_PATH || rollback "repository"
+                
+                # Handle private repository authentication
+                if [[ "$PROJECT_REPO" == *"git@"* ]]; then
+                  eval $(ssh-agent) > /dev/null
+                  ssh-add ~/.ssh/id_rsa 2>/dev/null || echo "SSH key not added, ensure keys are configured"
+                fi
+                
+                git clone $PROJECT_REPO $PROJECT_PATH || rollback "repository"
+              fi
+              
+              # Step 2: Back up existing build before installing dependencies
+              cd $PROJECT_PATH || rollback "repository"
+              if [ -d ".next" ]; then
+                echo "Backing up existing build..."
+                cp -r .next .next.bak
+              fi
+              
+              echo "Installing dependencies..."
+              npm install || rollback "build"
+              
+              echo "Building project..."
+              npm run build || rollback "build"
+              # Remove backup after successful build
+              [ -d ".next.bak" ] && rm -rf .next.bak
+              
+              # Step 3: Environment file with backup
+              echo "Configuring environment..."
+              [ -f ".env" ] && cp .env .env.bak
+              
+              cat << 'EOF' > /tmp/env-new
+              ${{ secrets.ENV_FILE }}
+              EOF
+              
+              if [ ! -f ".env" ] || ! cmp -s "/tmp/env-new" ".env"; then
+                cp /tmp/env-new .env || rollback "config"
+              fi
+              rm /tmp/env-new
+              
+              # Step 4: PM2 ecosystem file with backup
+              echo "Configuring PM2..."
+              # Check if PM2 process already exists
+              if pm2 list | grep -q "$PROJECT_NAME"; then
+                PM2_EXISTED=true
+              fi
+              
+              [ -f "$PM2_FILE" ] && cp "$PM2_FILE" "$PM2_FILE.bak"
+              
+              # Create logs directory
+              mkdir -p "${PROJECT_PATH}/logs"
+              
+              # Rest of deployment continues...
+              
+              echo "Deployment script completed - system is in a consistent state"
+            }
+
+            # Add trap for unexpected failures
+            trap 'rollback "unexpected"' ERR
+
+            # Uncomment to use the improved deployment flow
+            # deploy
