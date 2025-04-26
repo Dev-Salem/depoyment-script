@@ -160,15 +160,12 @@ jobs:
               cd $PROJECT_PATH || handle_error "Failed to change to project directory" 
             fi
 
-            # Step 2: Install dependencies and build the project with error handling
+            # Step 2: Install dependencies
             echo "Installing dependencies..."
             cd $PROJECT_PATH || handle_error "Failed to change directory"
             npm install || handle_error "Failed to install dependencies"
 
-            echo "Building project..."
-            npm run build || handle_error "Failed to build project"
-
-            # Step 3: Create environment file from GitHub secrets
+            # Step 3: Create environment file from GitHub secrets BEFORE building
             echo "Checking for environment file changes..."
             cat << 'EOF' > /tmp/env-new
             ${{ secrets.ENV_FILE }}
@@ -182,7 +179,11 @@ jobs:
             fi
             rm /tmp/env-new
 
-            # Step 4: Configure PM2 ecosystem file
+            # Step 4: Build the project with error handling
+            echo "Building project..."
+            npm run build || handle_error "Failed to build project"
+
+            # Step 5: Configure PM2 ecosystem file
             echo "Checking for PM2 config changes..."
             PM2_FILE="ecosystem.config.${PM2_FILE_TYPE}"
 
@@ -224,7 +225,7 @@ jobs:
             fi
             rm /tmp/ecosystem-new.config
 
-            # Step 5: Create and configure Nginx - check for project-specific static dirs
+            # Step 6: Create and configure Nginx - check for project-specific static dirs
             echo "Checking Nginx configuration..."
 
             # Check if custom directories exist
@@ -327,17 +328,17 @@ jobs:
             echo "Testing Nginx configuration..."
             sudo nginx -t || handle_error "Nginx configuration test failed"
 
-            # Step 6: Restart/start PM2 process and reload Nginx
+            # Step 7: Restart/start PM2 process and reload Nginx
             echo "Starting/restarting services..."
             cd $PROJECT_PATH || handle_error "Failed to change directory"
 
-            # Start or reload PM2 process
+            # Start or reload PM2 process with updated environment variables
             if pm2 list | grep -q "$PROJECT_NAME"; then
-              echo "Reloading PM2 process..."
-              pm2 reload "$PM2_FILE" || handle_error "Failed to reload PM2 process"
+              echo "Reloading PM2 process with updated environment..."
+              pm2 reload "$PM2_FILE" --update-env || handle_error "Failed to reload PM2 process"
             else
-              echo "Starting PM2 process..."
-              pm2 start "$PM2_FILE" || handle_error "Failed to start PM2 process"
+              echo "Starting PM2 process with fresh environment..."
+              pm2 start "$PM2_FILE" --update-env || handle_error "Failed to start PM2 process"
             fi
 
             # Save PM2 process list
@@ -347,7 +348,7 @@ jobs:
             echo "Reloading Nginx..."
             sudo systemctl reload nginx || handle_error "Failed to reload Nginx"
 
-            # Step 7: Set up or check SSL
+            # Step 8: Set up or check SSL
             # Check if certificate exists and is not about to expire (less than 30 days)
             if [ ! -d "/etc/letsencrypt/live/${PROJECT_DOMAIN}" ] || 
                [ "$(sudo certbot certificates -d "${PROJECT_DOMAIN}" 2>/dev/null | grep 'VALID:' | grep -oP '\d+(?= days)' | head -1)" -lt "30" ]; then
@@ -477,22 +478,7 @@ jobs:
                 git clone $PROJECT_REPO $PROJECT_PATH || rollback "repository"
               fi
               
-              # Step 2: Back up existing build before installing dependencies
-              cd $PROJECT_PATH || rollback "repository"
-              if [ -d ".next" ]; then
-                echo "Backing up existing build..."
-                cp -r .next .next.bak
-              fi
-              
-              echo "Installing dependencies..."
-              npm install || rollback "build"
-              
-              echo "Building project..."
-              npm run build || rollback "build"
-              # Remove backup after successful build
-              [ -d ".next.bak" ] && rm -rf .next.bak
-              
-              # Step 3: Environment file with backup
+              # Step 2: Environment file with backup
               echo "Configuring environment..."
               [ -f ".env" ] && cp .env .env.bak
               
@@ -505,21 +491,276 @@ jobs:
               fi
               rm /tmp/env-new
               
-              # Step 4: PM2 ecosystem file with backup
-              echo "Configuring PM2..."
-              # Check if PM2 process already exists
-              if pm2 list | grep -q "$PROJECT_NAME"; then
-                PM2_EXISTED=true
+              # Step 3: Install dependencies and build
+              echo "Installing dependencies..."
+              npm install || rollback "build"
+              
+              echo "Building project..."
+              npm run build || rollback "build"
+              
+              # Remove backup after successful build
+              [ -d ".next.bak" ] && rm -rf .next.bak
+              
+              # Step 4: Configure PM2 ecosystem file
+              echo "Checking for PM2 config changes..."
+              PM2_FILE="ecosystem.config.${PM2_FILE_TYPE}"
+
+              cat << EOF > /tmp/ecosystem-new.config
+              module.exports = {
+                apps: [
+                  {
+                    name: "${PROJECT_NAME}",
+                    script: "npm",
+                    args: "start",
+                    cwd: "${PROJECT_PATH}",
+                    env: {
+                      NODE_ENV: "production",
+                      PORT: ${PORT},
+                      ${{ secrets.PM2_ENV_VARS }}
+                    },
+                    // Error log file path
+                    error_file: "${PROJECT_PATH}/logs/error.log",
+                    // Out log file path
+                    out_file: "${PROJECT_PATH}/logs/out.log",
+                    // Enable/disable watch mode
+                    watch: false,
+                    // Max memory restart (if app exceeds this, PM2 will restart it)
+                    max_memory_restart: "500M"
+                  }
+                ]
+              };
+              EOF
+
+              # Create logs directory if it doesn't exist
+              mkdir -p "${PROJECT_PATH}/logs" || handle_error "Failed to create logs directory"
+
+              # Only update if content differs or file doesn't exist
+              if [ ! -f "$PM2_FILE" ] || ! cmp -s "/tmp/ecosystem-new.config" "$PM2_FILE"; then
+                echo "Creating/updating PM2 ecosystem config..."
+                cp /tmp/ecosystem-new.config "$PM2_FILE" || handle_error "Failed to create PM2 config"
+              else
+                echo "PM2 config unchanged"
               fi
+              rm /tmp/ecosystem-new.config
+
+              # Step 5: Create and configure Nginx - check for project-specific static dirs
+              echo "Checking Nginx configuration..."
+
+              # Check if custom directories exist
+              HAS_UPLOADS=false
+              if [ -d "${PROJECT_PATH}/public/uploads" ]; then
+                HAS_UPLOADS=true
+              fi
+
+              # Create Nginx config
+              cat << EOF > /tmp/nginx-${PROJECT_NAME}
+              server {
+                server_name ${PROJECT_DOMAIN};
+
+                location / {
+                  proxy_pass http://localhost:${PORT};
+                  proxy_http_version 1.1;
+                  proxy_set_header Upgrade \$http_upgrade;
+                  proxy_set_header Connection 'upgrade';
+                  proxy_set_header Host \$host;
+                  proxy_cache_bypass \$http_upgrade;
+                }
+              EOF
+
+              # Only add uploads location if directory exists
+              if [ "$HAS_UPLOADS" = true ]; then
+                cat << EOF >> /tmp/nginx-${PROJECT_NAME}
+                
+                location /uploads/ {
+                  alias ${PROJECT_PATH}/public/uploads/;
+                  access_log off;
+                  expires 1y;
+                  add_header Cache-Control "public";
+                }
+              EOF
+              fi
+
+              # Next.js static files
+              if [ -d "${PROJECT_PATH}/.next/static" ]; then
+                cat << EOF >> /tmp/nginx-${PROJECT_NAME}
+                
+                location /_next/static/ {
+                  alias ${PROJECT_PATH}/.next/static/;
+                  access_log off;
+                  expires 30d;
+                  add_header Cache-Control "public";
+                }
+              EOF
+              fi
+
+              # Public static files
+              if [ -d "${PROJECT_PATH}/public/static" ]; then
+                cat << EOF >> /tmp/nginx-${PROJECT_NAME}
+                
+                location /static/ {
+                  alias ${PROJECT_PATH}/public/static/;
+                  access_log off;
+                  expires 30d;
+                  add_header Cache-Control "public";
+                }
+              EOF
+              fi
+
+              # Complete the server block
+              cat << EOF >> /tmp/nginx-${PROJECT_NAME}
+              }
+
+              server {
+                listen 80;
+                server_name ${PROJECT_DOMAIN};
+                return 301 https://\$host\$request_uri;
+              }
+              EOF
+
+              # Check if Nginx config already exists and compare
+              NGINX_CONFIG_PATH="/etc/nginx/sites-available/${PROJECT_NAME}"
+
+              if [ -f "$NGINX_CONFIG_PATH" ]; then
+                # Compare with existing config
+                if ! cmp -s "/tmp/nginx-${PROJECT_NAME}" "$NGINX_CONFIG_PATH"; then
+                  echo "Nginx configuration changed, updating..."
+                  sudo cp /tmp/nginx-${PROJECT_NAME} "$NGINX_CONFIG_PATH" || handle_error "Failed to update Nginx config"
+                else
+                  echo "Nginx configuration unchanged"
+                fi
+              else
+                # Create new config
+                echo "Creating new Nginx configuration..."
+                sudo cp /tmp/nginx-${PROJECT_NAME} "$NGINX_CONFIG_PATH" || handle_error "Failed to create Nginx config"
+              fi
+
+              rm /tmp/nginx-${PROJECT_NAME}
+
+              # Create symbolic link if not exists
+              if [ ! -f "/etc/nginx/sites-enabled/${PROJECT_NAME}" ]; then
+                echo "Creating Nginx symbolic link..."
+                sudo ln -s "$NGINX_CONFIG_PATH" "/etc/nginx/sites-enabled/${PROJECT_NAME}" || handle_error "Failed to create symbolic link"
+              fi
+
+              # Test Nginx configuration
+              echo "Testing Nginx configuration..."
+              sudo nginx -t || handle_error "Nginx configuration test failed"
+
+              # Step 6: Restart/start PM2 process and reload Nginx
+              echo "Starting/restarting services..."
+              cd $PROJECT_PATH || handle_error "Failed to change directory"
+
+              # Start or reload PM2 process with updated environment variables
+              if pm2 list | grep -q "$PROJECT_NAME"; then
+                echo "Reloading PM2 process with updated environment..."
+                pm2 reload "$PM2_FILE" --update-env || handle_error "Failed to reload PM2 process"
+              else
+                echo "Starting PM2 process with fresh environment..."
+                pm2 start "$PM2_FILE" --update-env || handle_error "Failed to start PM2 process"
+              fi
+
+              # Save PM2 process list
+              pm2 save || echo "Warning: Could not save PM2 process list"
+
+              # Restart Nginx only if necessary
+              echo "Reloading Nginx..."
+              sudo systemctl reload nginx || handle_error "Failed to reload Nginx"
+
+              # Step 7: Set up or check SSL
+              # Check if certificate exists and is not about to expire (less than 30 days)
+              if [ ! -d "/etc/letsencrypt/live/${PROJECT_DOMAIN}" ] || 
+                 [ "$(sudo certbot certificates -d "${PROJECT_DOMAIN}" 2>/dev/null | grep 'VALID:' | grep -oP '\d+(?= days)' | head -1)" -lt "30" ]; then
+                echo "Setting up or renewing SSL certificate..."
+                sudo certbot --nginx -d "${PROJECT_DOMAIN}" --non-interactive --agree-tos \
+                     --email ${{ secrets.SSL_EMAIL }} \
+                     --keep-until-expiring --redirect || echo "Warning: SSL setup/renewal had issues"
+              else
+                echo "SSL certificate is valid and not near expiration"
+              fi
+
+              echo "Deployment completed successfully!"
+            }
+
+            # ----- ROLLBACK MECHANISM -----
+            # This function is called by the trap on ERR signal
+            rollback() {
+              local EXIT_CODE=$?
+              local STEP=$1
+              echo "ERROR: Deployment failed at step: $STEP with exit code: $EXIT_CODE"
+              echo "Starting rollback procedure..."
               
-              [ -f "$PM2_FILE" ] && cp "$PM2_FILE" "$PM2_FILE.bak"
+              case $STEP in
+                "repository")
+                  echo "Rolling back repository changes..."
+                  if [ -d "$PROJECT_PATH" ] && [ ! -d "$PROJECT_PATH/.git" ]; then
+                    # Remove directory if it was just created without git initialization
+                    echo "Removing incomplete project directory"
+                    rm -rf "$PROJECT_PATH"
+                  elif [ -d "$PROJECT_PATH/.git" ] && [ -f "$PROJECT_PATH/.git/ORIG_HEAD" ]; then
+                    # Reset to previous state if git pull failed
+                    echo "Resetting git repository to previous state"
+                    cd "$PROJECT_PATH" && git reset --hard ORIG_HEAD
+                  fi
+                  ;;
+                  
+                "build")
+                  echo "Rolling back failed build..."
+                  if [ -d "$PROJECT_PATH/.next.bak" ]; then
+                    echo "Restoring previous build"
+                    rm -rf "$PROJECT_PATH/.next"
+                    mv "$PROJECT_PATH/.next.bak" "$PROJECT_PATH/.next"
+                  fi
+                  ;;
+                  
+                "config")
+                  echo "Rolling back configuration changes..."
+                  # Restore .env if backup exists
+                  if [ -f "$PROJECT_PATH/.env.bak" ]; then
+                    mv "$PROJECT_PATH/.env.bak" "$PROJECT_PATH/.env"
+                  fi
+                  # Restore PM2 config if backup exists
+                  if [ -f "$PROJECT_PATH/$PM2_FILE.bak" ]; then
+                    mv "$PROJECT_PATH/$PM2_FILE.bak" "$PROJECT_PATH/$PM2_FILE"
+                  fi
+                  ;;
+                  
+                "nginx")
+                  echo "Rolling back Nginx configuration..."
+                  if [ -f "/etc/nginx/sites-available/${PROJECT_NAME}.bak" ]; then
+                    sudo mv "/etc/nginx/sites-available/${PROJECT_NAME}.bak" "/etc/nginx/sites-available/${PROJECT_NAME}"
+                    sudo systemctl reload nginx
+                  elif [ -f "/etc/nginx/sites-available/${PROJECT_NAME}" ] && [ -z "$NGINX_EXISTED" ]; then
+                    # If Nginx config was newly created, remove it
+                    sudo rm -f "/etc/nginx/sites-available/${PROJECT_NAME}"
+                    [ -L "/etc/nginx/sites-enabled/${PROJECT_NAME}" ] && sudo rm -f "/etc/nginx/sites-enabled/${PROJECT_NAME}"
+                    sudo systemctl reload nginx
+                  fi
+                  ;;
+                  
+                "pm2")
+                  echo "Rolling back PM2 process..."
+                  if pm2 list | grep -q "$PROJECT_NAME"; then
+                    if [ -n "$PM2_EXISTED" ]; then
+                      # If PM2 process existed before, try to restore from backup
+                      if [ -f "$PROJECT_PATH/$PM2_FILE.bak" ]; then
+                        mv "$PROJECT_PATH/$PM2_FILE.bak" "$PROJECT_PATH/$PM2_FILE"
+                        pm2 reload "$PM2_FILE" || pm2 restart "$PROJECT_NAME"
+                      fi
+                    else
+                      # If PM2 process was newly created, stop and delete it
+                      pm2 delete "$PROJECT_NAME"
+                    fi
+                    pm2 save
+                  fi
+                  ;;
+                  
+                *)
+                  echo "No specific rollback action for step: $STEP"
+                  ;;
+              esac
               
-              # Create logs directory
-              mkdir -p "${PROJECT_PATH}/logs"
-              
-              # Rest of deployment continues...
-              
-              echo "Deployment script completed - system is in a consistent state"
+              echo "Rollback completed. System state might require manual verification."
+              exit $EXIT_CODE
             }
 
             # Add trap for unexpected failures
