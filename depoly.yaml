@@ -358,15 +358,77 @@ jobs:
             sudo systemctl reload nginx || handle_error "Failed to reload Nginx"
 
             # Step 8: Set up or check SSL
-            # Check if certificate exists and is not about to expire (less than 30 days)
-            if [ ! -d "/etc/letsencrypt/live/${PROJECT_DOMAIN}" ] || 
-               [ "$(sudo certbot certificates -d "${PROJECT_DOMAIN}" 2>/dev/null | grep 'VALID:' | grep -oP '\d+(?= days)' | head -1)" -lt "30" ]; then
+            echo "Checking SSL certificate status..."
+
+            # Check if domain resolves to current server
+            SERVER_IP=$(curl -s https://api.ipify.org || wget -qO- https://api.ipify.org)
+            DOMAIN_IP=$(dig +short ${PROJECT_DOMAIN} || host -t A ${PROJECT_DOMAIN} | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -1)
+
+            if [ -z "$DOMAIN_IP" ]; then
+              echo "WARNING: Could not resolve domain ${PROJECT_DOMAIN} to an IP address"
+              echo "SSL certificate may fail if domain is not properly configured"
+            elif [ "$SERVER_IP" != "$DOMAIN_IP" ]; then
+              echo "WARNING: Domain ${PROJECT_DOMAIN} does not point to this server's IP ($SERVER_IP)"
+              echo "SSL certificate acquisition may fail"
+            fi
+
+            # Check if ports 80 and 443 are available for Let's Encrypt validation
+            if netstat -tuln | grep -q ":80 "; then
+              if ! netstat -tuln | grep ":80 " | grep -q "nginx"; then
+                echo "WARNING: Port 80 is in use by a service other than nginx"
+                echo "Let's Encrypt validation may fail"
+              fi
+            fi
+
+            # Check certificate existence and expiration with more portable commands
+            CERT_EXISTS=false
+            CERT_DAYS_REMAINING=0
+
+            if [ -d "/etc/letsencrypt/live/${PROJECT_DOMAIN}" ]; then
+              CERT_EXISTS=true
+              # More portable way to check certificate expiration
+              if command -v openssl >/dev/null; then
+                CERT_PATH="/etc/letsencrypt/live/${PROJECT_DOMAIN}/cert.pem"
+                if [ -f "$CERT_PATH" ]; then
+                  CERT_END_DATE=$(sudo openssl x509 -enddate -noout -in "$CERT_PATH" | cut -d= -f2)
+                  CERT_END_EPOCH=$(sudo date -d "$CERT_END_DATE" +%s 2>/dev/null || sudo date -j -f "%b %d %T %Y %Z" "$CERT_END_DATE" +%s 2>/dev/null)
+                  NOW_EPOCH=$(date +%s)
+                  CERT_DAYS_REMAINING=$(( ($CERT_END_EPOCH - $NOW_EPOCH) / 86400 ))
+                  echo "Certificate for ${PROJECT_DOMAIN} expires in $CERT_DAYS_REMAINING days"
+                fi
+              else
+                # Fallback to certbot but with more portable grep
+                CERT_DAYS_REMAINING=$(sudo certbot certificates -d "${PROJECT_DOMAIN}" 2>/dev/null | grep 'VALID:' | grep -o '[0-9]* day' | grep -o '[0-9]*' | head -1 || echo "0")
+              fi
+            fi
+
+            if [ "$CERT_EXISTS" = false ] || [ "$CERT_DAYS_REMAINING" -lt "30" ]; then
               echo "Setting up or renewing SSL certificate..."
-              sudo certbot --nginx -d "${PROJECT_DOMAIN}" --non-interactive --agree-tos \
+              
+              # Backup Nginx configs before making changes
+              sudo mkdir -p /etc/nginx/sites-available/backup-before-ssl
+              sudo cp "/etc/nginx/sites-available/${PROJECT_NAME}" "/etc/nginx/sites-available/backup-before-ssl/${PROJECT_NAME}.$(date +%s)" 2>/dev/null || true
+              
+              # More robust error handling for SSL setup
+              if ! sudo certbot --nginx -d "${PROJECT_DOMAIN}" --non-interactive --agree-tos \
                    --email ${{ secrets.SSL_EMAIL }} \
-                   --keep-until-expiring --redirect || echo "Warning: SSL setup/renewal had issues"
+                   --keep-until-expiring --redirect; then
+                echo "ERROR: SSL certificate setup failed"
+                
+                # Try to restore from backup if needed
+                if [ -f "/etc/nginx/sites-available/backup-before-ssl/${PROJECT_NAME}.$(date +%s)" ]; then
+                  echo "Restoring Nginx config from backup..."
+                  sudo cp "/etc/nginx/sites-available/backup-before-ssl/${PROJECT_NAME}.$(date +%s)" "/etc/nginx/sites-available/${PROJECT_NAME}"
+                  sudo nginx -t && sudo systemctl reload nginx
+                fi
+                
+                # Continue but record the issue - SSL will be retried on next deployment
+                echo "Continuing deployment without valid SSL. Please check the certbot logs and fix DNS settings if needed."
+              else
+                echo "SSL certificate successfully installed/renewed"
+              fi
             else
-              echo "SSL certificate is valid and not near expiration"
+              echo "SSL certificate is valid and not near expiration ($CERT_DAYS_REMAINING days remaining)"
             fi
 
             echo "Deployment completed successfully!"
